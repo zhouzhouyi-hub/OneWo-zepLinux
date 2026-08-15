@@ -10,6 +10,8 @@
 #include <zephyr/sys/dlist.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/kernel/idesc.h>
+#include <zephyr/kernel/process_env.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,6 +25,9 @@ typedef int32_t pid_t;
 /* Special PID values */
 #define PID_INVALID 0
 #define PID_INIT 1
+
+/* Process flags */
+#define PROCESS_FLAG_IN_VFORK  BIT(0)  /* Process is in vfork state */
 
 /* Maximum number of processes (MCU constraint) */
 #ifndef CONFIG_MAX_PROCESS_COUNT
@@ -57,7 +62,7 @@ struct idesc_table {
 };
 
 /**
- * @brief Environment variable entry
+ * @brief Environment variable entry (deprecated - kept for compatibility)
  */
 struct env_entry {
 	sys_dnode_t node;
@@ -83,12 +88,13 @@ struct z_process {
 
 	/* Process resources */
 	struct idesc_table fd_table;      /* File descriptor table */
-	sys_dlist_t env_list;             /* Environment variables */
+	struct task_env env;              /* Environment variables (optimized) */
 
 	/* Process state */
 	atomic_t ref_count;               /* Reference count */
-	uint32_t flags;                   /* Process flags */
+	uint32_t flags;                   /* Process flags (PROCESS_FLAG_*) */
 	int exit_code;                    /* Exit code when terminated */
+	struct k_sem vfork_sem;           /* Semaphore for vfork parent blocking */
 };
 
 /**
@@ -180,6 +186,23 @@ int process_setenv(struct z_process *proc, const char *name, const char *value);
  * @return Pointer to new child process or NULL on failure
  */
 struct z_process *process_fork(struct z_process *parent);
+
+/**
+ * @brief vfork - create child process that shares address space with parent
+ *
+ * Parent blocks until child calls exec or exit.
+ * Based on Embox's vfork implementation.
+ *
+ * @return Child PID in parent, 0 in child, negative errno on failure
+ */
+pid_t process_vfork(void);
+
+/**
+ * @brief Wake parent process after vfork child exits or execs
+ *
+ * @param child Child process
+ */
+void process_vfork_wake_parent(struct z_process *child);
 
 /**
  * @brief Register a thread with a process

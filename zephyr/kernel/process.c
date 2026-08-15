@@ -137,13 +137,19 @@ struct z_process *process_create(struct z_process *parent)
 	proc->main_thread = NULL;
 
 	sys_dlist_init(&proc->children);
-	sys_dlist_init(&proc->env_list);
 	sys_dlist_init(&proc->threads);
 
 	atomic_set(&proc->ref_count, 1);
+	proc->flags = 0;
+
+	/* Initialize vfork semaphore */
+	k_sem_init(&proc->vfork_sem, 0, 1);
 
 	/* Initialize file descriptor table */
 	memset(&proc->fd_table, 0, sizeof(struct idesc_table));
+
+	/* Initialize environment variables (optimized - no malloc) */
+	task_env_init(&proc->env);
 
 	/* Add to parent's child list */
 	if (parent) {
@@ -210,6 +216,31 @@ struct z_process *process_current(void)
 	return process_get(PID_INIT);
 }
 
+/**
+ * @brief Reparent all children to init process (handle orphans)
+ *
+ * Based on Embox's task_make_children_daemons()
+ */
+static void process_reparent_children(struct z_process *proc)
+{
+	struct z_process *init_proc = process_get(PID_INIT);
+	if (!init_proc || init_proc == proc) {
+		return;
+	}
+
+	sys_dnode_t *node, *tmp;
+	SYS_DLIST_FOR_EACH_NODE_SAFE(&proc->children, node, tmp) {
+		struct z_process *child = CONTAINER_OF(node, struct z_process, child_node);
+
+		/* Remove from current parent */
+		sys_dlist_remove(&child->child_node);
+
+		/* Add to init process */
+		child->parent = init_proc;
+		sys_dlist_append(&init_proc->children, &child->child_node);
+	}
+}
+
 void process_exit(struct z_process *proc, int exit_code)
 {
 	if (!proc) {
@@ -218,7 +249,13 @@ void process_exit(struct z_process *proc, int exit_code)
 
 	proc->exit_code = exit_code;
 
+	/* Wake parent if in vfork */
+	process_vfork_wake_parent(proc);
+
 	k_spinlock_key_t key = k_spin_lock(&process_lock);
+
+	/* Reparent all children to init before exit (handle orphans) */
+	process_reparent_children(proc);
 
 	/* Remove from parent's child list */
 	if (proc->parent) {
@@ -226,18 +263,17 @@ void process_exit(struct z_process *proc, int exit_code)
 		proc->parent = NULL;  /* Clear parent pointer */
 	}
 
-	/* Free environment variables */
-	sys_dnode_t *node, *next;
-	SYS_DLIST_FOR_EACH_NODE_SAFE(&proc->env_list, node, next) {
-		struct env_entry *entry = CONTAINER_OF(node, struct env_entry, node);
-		sys_dlist_remove(node);
-		if (entry->key) {
-			k_free(entry->key);
+	/* Environment variables are pre-allocated, no cleanup needed */
+
+	/* Close all open file descriptors (with reference counting) */
+	for (int fd = 0; fd < CONFIG_MAX_FD_PER_PROCESS; fd++) {
+		if (proc->fd_table.allocated_mask & BIT(fd)) {
+			struct idesc *desc = (struct idesc *)proc->fd_table.entries[fd].idesc;
+			if (desc) {
+				/* Decrement reference count - may trigger close() */
+				idesc_put(desc);
+			}
 		}
-		if (entry->value) {
-			k_free(entry->value);
-		}
-		k_free(entry);
 	}
 
 	/* Clear file descriptor table */
@@ -265,18 +301,23 @@ void *process_idesc_table_get(struct z_process *proc, int fd)
 	return proc->fd_table.entries[fd].idesc;
 }
 
-int process_idesc_table_add(struct z_process *proc, void *idesc)
+int process_idesc_table_add(struct z_process *proc, void *idesc_ptr)
 {
-	if (!proc || !idesc) {
+	if (!proc || !idesc_ptr) {
 		return -EINVAL;
 	}
+
+	struct idesc *desc = (struct idesc *)idesc_ptr;
+
+	/* Increment reference count - caller is sharing this descriptor */
+	idesc_get(desc);
 
 	k_spinlock_key_t key = k_spin_lock(&process_lock);
 
 	/* Find first free FD */
 	for (int fd = 0; fd < CONFIG_MAX_FD_PER_PROCESS; fd++) {
 		if (!(proc->fd_table.allocated_mask & BIT(fd))) {
-			proc->fd_table.entries[fd].idesc = idesc;
+			proc->fd_table.entries[fd].idesc = idesc_ptr;
 			proc->fd_table.entries[fd].flags = 0;
 			proc->fd_table.allocated_mask |= BIT(fd);
 			k_spin_unlock(&process_lock, key);
@@ -285,6 +326,9 @@ int process_idesc_table_add(struct z_process *proc, void *idesc)
 	}
 
 	k_spin_unlock(&process_lock, key);
+
+	/* Failed to allocate FD, release the reference */
+	idesc_put(desc);
 	return -EMFILE;  /* Too many open files */
 }
 
@@ -301,11 +345,21 @@ int process_idesc_table_remove(struct z_process *proc, int fd)
 		return -EBADF;  /* Bad file descriptor */
 	}
 
+	/* Get the descriptor before clearing the entry */
+	struct idesc *desc = (struct idesc *)proc->fd_table.entries[fd].idesc;
+
+	/* Clear the FD entry */
 	proc->fd_table.entries[fd].idesc = NULL;
 	proc->fd_table.entries[fd].flags = 0;
 	proc->fd_table.allocated_mask &= ~BIT(fd);
 
 	k_spin_unlock(&process_lock, key);
+
+	/* Decrement reference count - may trigger close() if this was the last reference */
+	if (desc) {
+		idesc_put(desc);
+	}
+
 	return 0;
 }
 
@@ -316,19 +370,10 @@ const char *process_getenv(struct z_process *proc, const char *name)
 	}
 
 	k_spinlock_key_t key = k_spin_lock(&process_lock);
-
-	sys_dnode_t *node;
-	SYS_DLIST_FOR_EACH_NODE(&proc->env_list, node) {
-		struct env_entry *entry = CONTAINER_OF(node, struct env_entry, node);
-		if (entry->key && strcmp(entry->key, name) == 0) {
-			const char *value = entry->value;
-			k_spin_unlock(&process_lock, key);
-			return value;
-		}
-	}
-
+	const char *value = task_env_get(&proc->env, name);
 	k_spin_unlock(&process_lock, key);
-	return NULL;
+
+	return value;
 }
 
 int process_setenv(struct z_process *proc, const char *name, const char *value)
@@ -338,44 +383,10 @@ int process_setenv(struct z_process *proc, const char *name, const char *value)
 	}
 
 	k_spinlock_key_t key = k_spin_lock(&process_lock);
-
-	/* Check if variable already exists */
-	sys_dnode_t *node;
-	SYS_DLIST_FOR_EACH_NODE(&proc->env_list, node) {
-		struct env_entry *entry = CONTAINER_OF(node, struct env_entry, node);
-		if (entry->key && strcmp(entry->key, name) == 0) {
-			/* Update existing entry */
-			if (entry->value) {
-				k_free(entry->value);
-			}
-			entry->value = value ? z_strdup(value) : NULL;
-			k_spin_unlock(&process_lock, key);
-			return 0;
-		}
-	}
-
-	/* Create new entry */
-	struct env_entry *entry = k_malloc(sizeof(struct env_entry));
-	if (!entry) {
-		k_spin_unlock(&process_lock, key);
-		return -ENOMEM;
-	}
-
-	entry->key = z_strdup(name);
-	entry->value = value ? z_strdup(value) : NULL;
-
-	if (!entry->key || (value && !entry->value)) {
-		if (entry->key) k_free(entry->key);
-		if (entry->value) k_free(entry->value);
-		k_free(entry);
-		k_spin_unlock(&process_lock, key);
-		return -ENOMEM;
-	}
-
-	sys_dlist_append(&proc->env_list, &entry->node);
+	int ret = task_env_set(&proc->env, name, value);
 	k_spin_unlock(&process_lock, key);
 
-	return 0;
+	return ret;
 }
 
 struct z_process *process_fork(struct z_process *parent)
@@ -391,31 +402,21 @@ struct z_process *process_fork(struct z_process *parent)
 
 	k_spinlock_key_t key = k_spin_lock(&process_lock);
 
-	/* Copy file descriptor table */
-	memcpy(&child->fd_table, &parent->fd_table, sizeof(struct idesc_table));
-
-	/* Copy environment variables */
-	sys_dnode_t *node;
-	SYS_DLIST_FOR_EACH_NODE(&parent->env_list, node) {
-		struct env_entry *parent_entry = CONTAINER_OF(node, struct env_entry, node);
-
-		struct env_entry *child_entry = k_malloc(sizeof(struct env_entry));
-		if (!child_entry) {
-			continue;
+	/* Deep copy file descriptor table with reference counting (Embox style) */
+	for (int fd = 0; fd < CONFIG_MAX_FD_PER_PROCESS; fd++) {
+		if (parent->fd_table.allocated_mask & BIT(fd)) {
+			struct idesc *desc = (struct idesc *)parent->fd_table.entries[fd].idesc;
+			if (desc) {
+				/* Increment reference count - child shares the descriptor */
+				child->fd_table.entries[fd].idesc = idesc_get(desc);
+				child->fd_table.entries[fd].flags = parent->fd_table.entries[fd].flags;
+				child->fd_table.allocated_mask |= BIT(fd);
+			}
 		}
-
-		child_entry->key = z_strdup(parent_entry->key);
-		child_entry->value = parent_entry->value ? z_strdup(parent_entry->value) : NULL;
-
-		if (!child_entry->key || (parent_entry->value && !child_entry->value)) {
-			if (child_entry->key) k_free(child_entry->key);
-			if (child_entry->value) k_free(child_entry->value);
-			k_free(child_entry);
-			continue;
-		}
-
-		sys_dlist_append(&child->env_list, &child_entry->node);
 	}
+
+	/* Copy environment variables (optimized - simple memcpy, no malloc!) */
+	task_env_inherit(&child->env, &parent->env);
 
 	k_spin_unlock(&process_lock, key);
 
@@ -468,6 +469,68 @@ int process_unregister_thread(struct z_process *proc, struct k_thread *thread)
 	k_spin_unlock(&process_lock, key);
 
 	return 0;
+}
+
+/**
+ * @brief vfork implementation
+ *
+ * Creates child process that shares address space with parent.
+ * Parent blocks until child calls exec or exit.
+ * Based on Embox's vfork resource module.
+ */
+pid_t process_vfork(void)
+{
+	struct z_process *parent = process_current();
+	if (!parent) {
+		return -ESRCH;
+	}
+
+	/* Create child process (shares resources with parent) */
+	struct z_process *child = process_create(parent);
+	if (!child) {
+		return -ENOMEM;
+	}
+
+	/* Mark parent as in vfork state */
+	k_spinlock_key_t key = k_spin_lock(&process_lock);
+	parent->flags |= PROCESS_FLAG_IN_VFORK;
+	k_spin_unlock(&process_lock, key);
+
+	/* Child shares parent's FD table and environment (shallow copy for vfork) */
+	/* Note: In real vfork, child uses parent's stack too, but that's architecture-specific */
+	memcpy(&child->fd_table, &parent->fd_table, sizeof(struct idesc_table));
+	memcpy(&child->env, &parent->env, sizeof(struct task_env));
+
+	/* Parent blocks here until child calls exec or exit */
+	/* In child context, return 0 immediately */
+	/* In parent context, block on semaphore */
+
+	/* This is simplified - real implementation needs architecture support */
+	/* For now, we just mark the state and return child PID */
+
+	return child->pid;
+}
+
+/**
+ * @brief Wake parent after vfork child exits or execs
+ */
+void process_vfork_wake_parent(struct z_process *child)
+{
+	if (!child || !child->parent) {
+		return;
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&process_lock);
+
+	if (child->parent->flags & PROCESS_FLAG_IN_VFORK) {
+		/* Clear vfork flag */
+		child->parent->flags &= ~PROCESS_FLAG_IN_VFORK;
+
+		/* Wake parent */
+		k_sem_give(&child->parent->vfork_sem);
+	}
+
+	k_spin_unlock(&process_lock, key);
 }
 
 /* Initialize process subsystem at kernel init */

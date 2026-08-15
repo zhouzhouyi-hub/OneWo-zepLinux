@@ -4,4 +4,14 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(process_management_test)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE
+    src/main.c
+    test_phase1_fd_refcount.c
+    test_phase1_shell.c
+    shell_process_stubs.c
+)
+
+# Add test idesc implementation (correct path from test directory)
+target_sources(app PRIVATE
+    ${ZEPHYR_BASE}/kernel/test_idesc.c
+)
